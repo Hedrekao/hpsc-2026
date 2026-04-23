@@ -13,7 +13,7 @@ int main(int argc, char** argv) {
   int size, rank;
   MPI_Comm_size(MPI_COMM_WORLD, &size);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  Body ibody[N/size], jbody[N/size];
+  Body ibody[N/size], jbody[N/size], sendbuf[N/size];
   srand48(rank);
   for(int i=0; i<N/size; i++) {
     ibody[i].x = jbody[i].x = drand48();
@@ -28,8 +28,11 @@ int main(int argc, char** argv) {
   MPI_Win win;
   MPI_Win_create(jbody, N/size*sizeof(Body), sizeof(Body), MPI_INFO_NULL, MPI_COMM_WORLD, &win);
   for(int irank=0; irank<size; irank++) {
+    for(int i=0; i<N/size; i++) {
+      sendbuf[i] = jbody[i];
+    }
     MPI_Win_fence(0, win);
-    MPI_Win_Put(jbody, N/size, MPI_BODY, send_to, 0, N/size, MPI_BODY, win);
+    MPI_Put(sendbuf, N/size, MPI_BODY, send_to, 0, N/size, MPI_BODY, win);
     MPI_Win_fence(0, win);
     for(int i=0; i<N/size; i++) {
       for(int j=0; j<N/size; j++) {

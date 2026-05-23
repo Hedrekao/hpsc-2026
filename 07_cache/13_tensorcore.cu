@@ -14,18 +14,23 @@ using namespace std;
 using namespace nvcuda;
 
 constexpr int TILE_M = 128;
-constexpr int TILE_N = 64;
+constexpr int TILE_N = 128;
 constexpr int TILE_K = 16;
 constexpr int ACC_ROWS = 2;
 constexpr int ACC_COLS = 4;
 
-__global__ __launch_bounds__(128) void kernel(int dim_m, int dim_n, int dim_k,
+__global__ __launch_bounds__(256) void kernel(int dim_m, int dim_n, int dim_k,
                        const half *__restrict__ d_a,
                        const half *__restrict__ d_b,
                        float *__restrict__ d_c) {
   const int offset_a_m = TILE_M * blockIdx.x;
   const int offset_b_n = TILE_N * blockIdx.y;
   const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int warp_row = warp_id >> 1;
+  const int warp_col = warp_id & 1;
+  const int m_group = warp_row * 32;
+  const int n_group = warp_col * 64;
 
   __shared__ __align__(16) half block_a[TILE_K][TILE_M];
   __shared__ __align__(16) half block_b[TILE_K][TILE_N];
@@ -46,7 +51,7 @@ __global__ __launch_bounds__(128) void kernel(int dim_m, int dim_n, int dim_k,
     __syncthreads();
 
     if (warp_id < 2) {
-      const int a_col = (warp_id * 32 + (threadIdx.x & 31)) * 2;
+      const int a_col = (warp_id * 32 + lane) * 2;
       #pragma unroll
       for (int j = 0; j < TILE_K; ++j) {
         *reinterpret_cast<half2 *>(&block_a[j][a_col]) =
@@ -54,11 +59,14 @@ __global__ __launch_bounds__(128) void kernel(int dim_m, int dim_n, int dim_k,
       }
     }
 
-    if (warp_id >= 2) {
-      const int b_col = (warp_id - 2) * 32 + (threadIdx.x & 31);
+    if (warp_id >= 2 && warp_id < 6) {
+      const int b_col = (warp_id - 2) * 32 + lane;
+      const half2 *b_tile = reinterpret_cast<const half2 *>(&d_b[(offset_b_n + b_col) * dim_k + k]);
       #pragma unroll
-      for (int j = 0; j < TILE_K; ++j) {
-        block_b[j][b_col] = d_b[(offset_b_n + b_col) * dim_k + k + j];
+      for (int j = 0; j < TILE_K; j += 2) {
+        const half2 b_vec = b_tile[j / 2];
+        block_b[j][b_col] = __low2half(b_vec);
+        block_b[j + 1][b_col] = __high2half(b_vec);
       }
     }
 
@@ -66,13 +74,12 @@ __global__ __launch_bounds__(128) void kernel(int dim_m, int dim_n, int dim_k,
 
     #pragma unroll
     for (int c = 0; c < ACC_COLS; ++c) {
-      wmma::load_matrix_sync(b_frag[c], &block_b[0][c * 16], TILE_N);
+      wmma::load_matrix_sync(b_frag[c], &block_b[0][n_group + c * 16], TILE_N);
     }
 
     #pragma unroll
     for (int r = 0; r < ACC_ROWS; ++r) {
-      const int row_tile = warp_id * ACC_ROWS + r;
-      wmma::load_matrix_sync(a_frag[r], &block_a[0][row_tile * 16], TILE_M);
+      wmma::load_matrix_sync(a_frag[r], &block_a[0][m_group + r * 16], TILE_M);
       #pragma unroll
       for (int c = 0; c < ACC_COLS; ++c) {
         wmma::mma_sync(acc[r][c], a_frag[r], b_frag[c], acc[r][c]);
@@ -84,8 +91,8 @@ __global__ __launch_bounds__(128) void kernel(int dim_m, int dim_n, int dim_k,
   for (int r = 0; r < ACC_ROWS; ++r) {
     #pragma unroll
     for (int c = 0; c < ACC_COLS; ++c) {
-      const int c_m = offset_a_m + (warp_id * ACC_ROWS + r) * 16;
-      const int c_n = offset_b_n + c * 16;
+      const int c_m = offset_a_m + m_group + r * 16;
+      const int c_n = offset_b_n + n_group + c * 16;
       wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
     }
   }
@@ -165,7 +172,7 @@ int main(int argc, const char **argv) {
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-  dim3 block = dim3(128);
+  dim3 block = dim3(256);
   dim3 grid = dim3((m + TILE_M - 1) / TILE_M, (n + TILE_N - 1) / TILE_N);
   for (int i = 0; i < Nt + 2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();

@@ -25,4 +25,10 @@
 12_vector_4x2: 12_vector_4x2.cu
 	nvcc 12_vector_4x2.cu -Xcompiler "-O3 -fopenmp" -lcublas
 13_tensorcore: 13_tensorcore.cu
-	nvcc 13_tensorcore.cu -Xcompiler "-O3 -fopenmp" -lcublas
+	nvcc 13_tensorcore.cu \
+  -O3 \
+  -arch=sm_90a \
+  --use_fast_math \
+  -Xptxas=-O3,-v \
+  -lcublas
+#	nvcc 13_tensorcore.cu -Xcompiler "-O3 -fopenmp" -lcublas

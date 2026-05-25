@@ -14,69 +14,117 @@
 using namespace std;
 using namespace nvcuda;
 
+
 constexpr int BLOCK_M = 128;
 constexpr int BLOCK_N = 128;
-constexpr int BLOCK_K = 32;
+constexpr int BLOCK_K = 64;
 
-constexpr int WARPS_PER_BLOCK = 8;
+constexpr int WARPS_PER_BLOCK = 4;
 constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
 
-constexpr int WARP_TILE_M = 32;
+constexpr int WARP_TILE_M = 64;
 constexpr int WARP_TILE_N = 64;
 
-// Upgraded from 2 to 4 stages to fully hide H100 global memory latency
-constexpr int STAGES = 4;
+constexpr int STAGES = 3;
 constexpr int SMEM_PAD = 8;
 
-// Macro to cleanly issue asynchronous global-to-shared copies.
-// _Pragma("unroll") ensures the compiler vectorizes the memory addresses perfectly.
+// ============================================================
+// Async load helper
+// ============================================================
+
 #define LOAD_TILE(STAGE, KB, block_row, block_col) \
 do { \
     half* stageA = smemA + (STAGE) * BLOCK_K * (BLOCK_M + SMEM_PAD); \
     half* stageB = smemB + (STAGE) * BLOCK_N * (BLOCK_K + SMEM_PAD); \
+    \
     _Pragma("unroll") \
-    for (int idx = threadIdx.x; idx < (BLOCK_M * BLOCK_K) / 8; idx += THREADS_PER_BLOCK) { \
-        int local_row = (idx * 8) % BLOCK_M; \
-        int local_col = (idx * 8) / BLOCK_M; \
-        __pipeline_memcpy_async(&stageA[local_col * (BLOCK_M + SMEM_PAD) + local_row], \
-                                &A[((KB) + local_col) * dim_m + ((block_row) + local_row)], 16); \
+    for (int idx = threadIdx.x * 8; idx < BLOCK_M * BLOCK_K; idx += THREADS_PER_BLOCK * 8) { \
+        int local_row = idx % BLOCK_M; \
+        int local_col = idx / BLOCK_M; \
+        \
+        int global_row = (block_row) + local_row; \
+        int global_col = (KB) + local_col; \
+        \
+        if (global_row < dim_m && global_col < dim_k) { \
+            const int4* src = reinterpret_cast<const int4*>( \
+                &A[global_col * dim_m + global_row]); \
+            \
+            int4* dst = reinterpret_cast<int4*>( \
+                &stageA[local_col * (BLOCK_M + SMEM_PAD) + local_row]); \
+            \
+            __pipeline_memcpy_async(dst, src, sizeof(int4)); \
+        } \
     } \
+    \
     _Pragma("unroll") \
-    for (int idx = threadIdx.x; idx < (BLOCK_K * BLOCK_N) / 8; idx += THREADS_PER_BLOCK) { \
-        int local_row = (idx * 8) % BLOCK_K; \
-        int local_col = (idx * 8) / BLOCK_K; \
-        __pipeline_memcpy_async(&stageB[local_col * (BLOCK_K + SMEM_PAD) + local_row], \
-                                &B[((block_col) + local_col) * dim_k + ((KB) + local_row)], 16); \
+    for (int idx = threadIdx.x * 8; idx < BLOCK_K * BLOCK_N; idx += THREADS_PER_BLOCK * 8) { \
+        int local_row = idx % BLOCK_K; \
+        int local_col = idx / BLOCK_K; \
+        \
+        int global_row = (KB) + local_row; \
+        int global_col = (block_col) + local_col; \
+        \
+        if (global_row < dim_k && global_col < dim_n) { \
+            const int4* src = reinterpret_cast<const int4*>( \
+                &B[global_col * dim_k + global_row]); \
+            \
+            int4* dst = reinterpret_cast<int4*>( \
+                &stageB[local_col * (BLOCK_K + SMEM_PAD) + local_row]); \
+            \
+            __pipeline_memcpy_async(dst, src, sizeof(int4)); \
+        } \
     } \
+    \
     __pipeline_commit(); \
 } while(0)
 
-// Macro to handle the Tensor Core math loop.
+// ============================================================
+// Tensor Core compute
+// ============================================================
+
 #define COMPUTE_TILE() \
 do { \
     _Pragma("unroll") \
     for (int kk = 0; kk < BLOCK_K; kk += 16) { \
+        \
         _Pragma("unroll") \
-        for (int i = 0; i < 2; i++) { \
+        for (int i = 0; i < 4; i++) { \
             int a_row = warp_row * WARP_TILE_M + i * 16; \
-            wmma::load_matrix_sync(a_frag[i], &computeA[kk * (BLOCK_M + SMEM_PAD) + a_row], BLOCK_M + SMEM_PAD); \
+            \
+            wmma::load_matrix_sync( \
+                a_frag[i], \
+                &computeA[kk * (BLOCK_M + SMEM_PAD) + a_row], \
+                BLOCK_M + SMEM_PAD); \
         } \
+        \
         _Pragma("unroll") \
         for (int j = 0; j < 4; j++) { \
             int b_col = warp_col * WARP_TILE_N + j * 16; \
-            wmma::load_matrix_sync(b_frag[j], &computeB[b_col * (BLOCK_K + SMEM_PAD) + kk], BLOCK_K + SMEM_PAD); \
+            \
+            wmma::load_matrix_sync( \
+                b_frag[j], \
+                &computeB[b_col * (BLOCK_K + SMEM_PAD) + kk], \
+                BLOCK_K + SMEM_PAD); \
         } \
+        \
         _Pragma("unroll") \
-        for (int i = 0; i < 2; i++) { \
+        for (int i = 0; i < 4; i++) { \
             _Pragma("unroll") \
             for (int j = 0; j < 4; j++) { \
-                wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]); \
+                wmma::mma_sync( \
+                    acc[i][j], \
+                    a_frag[i], \
+                    b_frag[j], \
+                    acc[i][j]); \
             } \
         } \
     } \
 } while(0)
 
-// launch bounds force 2 blocks per SM to ensure high occupancy with the new shared memory usage
+// ============================================================
+// Kernel
+// ============================================================
+
 __global__ __launch_bounds__(THREADS_PER_BLOCK, 2)
 void kernel(
     int dim_m,
@@ -89,29 +137,57 @@ void kernel(
     extern __shared__ half smem[];
 
     half* smemA = smem;
-    half* smemB = smem + STAGES * BLOCK_K * (BLOCK_M + SMEM_PAD);
+
+    half* smemB =
+        smem +
+        STAGES * BLOCK_K * (BLOCK_M + SMEM_PAD);
 
     const int warp_id = threadIdx.x >> 5;
+
     const int warp_row = warp_id >> 1;
     const int warp_col = warp_id & 1;
 
     const int block_row = blockIdx.x * BLOCK_M;
     const int block_col = blockIdx.y * BLOCK_N;
 
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+    // --------------------------------------------------------
+    // Accumulators
+    // --------------------------------------------------------
+
+    wmma::fragment<
+        wmma::accumulator,
+        16,16,16,
+        float> acc[4][4];
 
     #pragma unroll
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             wmma::fill_fragment(acc[i][j], 0.0f);
         }
     }
 
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag[2];
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag[4];
+    // --------------------------------------------------------
+    // Fragments
+    // --------------------------------------------------------
 
-    // --- Prologue: Fill the pipeline ---
+    wmma::fragment<
+        wmma::matrix_a,
+        16,16,16,
+        half,
+        wmma::col_major> a_frag[4];
+
+    wmma::fragment<
+        wmma::matrix_b,
+        16,16,16,
+        half,
+        wmma::col_major> b_frag[4];
+
+    // ========================================================
+    // Prologue
+    // ========================================================
+
+    #pragma unroll
     for (int stage = 0; stage < STAGES - 1; ++stage) {
         LOAD_TILE(stage, stage * BLOCK_K, block_row, block_col);
     }
@@ -119,48 +195,81 @@ void kernel(
     int write_stage = STAGES - 1;
     int read_stage = 0;
 
-    // --- Main Pipeline Loop ---
-    for (int kb = (STAGES - 1) * BLOCK_K; kb < dim_k; kb += BLOCK_K)
+    // ========================================================
+    // Main loop
+    // ========================================================
+
+    for (int kb = (STAGES - 1) * BLOCK_K;
+         kb < dim_k;
+         kb += BLOCK_K)
     {
-        // 1. Asynchronously issue hardware copies for the NEXT tile
         LOAD_TILE(write_stage, kb, block_row, block_col);
 
-        // 2. Wait until only STAGES-1 requests are in flight (meaning the oldest one has landed)
-        __pipeline_wait_prior(STAGES - 1);
+        __pipeline_wait_prior(STAGES - 2);
+
         __syncthreads();
 
-        // 3. Compute the CURRENT tile
-        half* computeA = smemA + read_stage * BLOCK_K * (BLOCK_M + SMEM_PAD);
-        half* computeB = smemB + read_stage * BLOCK_N * (BLOCK_K + SMEM_PAD);
+        half* computeA =
+            smemA +
+            read_stage * BLOCK_K * (BLOCK_M + SMEM_PAD);
+
+        half* computeB =
+            smemB +
+            read_stage * BLOCK_N * (BLOCK_K + SMEM_PAD);
 
         COMPUTE_TILE();
 
-        write_stage = (write_stage + 1) % STAGES;
-        read_stage = (read_stage + 1) % STAGES;
+        write_stage =
+            (write_stage + 1) % STAGES;
+
+        read_stage =
+            (read_stage + 1) % STAGES;
     }
 
-    // --- Epilogue: Drain the pipeline ---
-    for (int stage = 0; stage < STAGES - 1; ++stage) {
-        __pipeline_wait_prior(STAGES - 2 - stage);
-        __syncthreads();
+    // ========================================================
+    // Drain pipeline
+    // ========================================================
 
-        half* computeA = smemA + read_stage * BLOCK_K * (BLOCK_M + SMEM_PAD);
-        half* computeB = smemB + read_stage * BLOCK_N * (BLOCK_K + SMEM_PAD);
-
-        COMPUTE_TILE();
-
-        read_stage = (read_stage + 1) % STAGES;
-    }
-
-    // --- Store Out ---
     #pragma unroll
-    for (int i = 0; i < 2; i++)
+    for (int stage = 0; stage < STAGES - 1; ++stage)
+    {
+        __pipeline_wait_prior(STAGES - 2 - stage);
+
+        __syncthreads();
+
+        half* computeA =
+            smemA +
+            read_stage * BLOCK_K * (BLOCK_M + SMEM_PAD);
+
+        half* computeB =
+            smemB +
+            read_stage * BLOCK_N * (BLOCK_K + SMEM_PAD);
+
+        COMPUTE_TILE();
+
+        read_stage =
+            (read_stage + 1) % STAGES;
+    }
+
+    // ========================================================
+    // Store
+    // ========================================================
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
     {
         #pragma unroll
         for (int j = 0; j < 4; j++)
         {
-            int c_row = block_row + warp_row * WARP_TILE_M + i * 16;
-            int c_col = block_col + warp_col * WARP_TILE_N + j * 16;
+            int c_row =
+                block_row +
+                warp_row * WARP_TILE_M +
+                i * 16;
+
+            int c_col =
+                block_col +
+                warp_col * WARP_TILE_N +
+                j * 16;
 
             if (c_row < dim_m && c_col < dim_n)
             {
@@ -233,6 +342,7 @@ int main(int argc, const char **argv) {
     auto tic = chrono::steady_clock::now();
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
+
         cublasGemmEx(
             cublas_handle,
             CUBLAS_OP_N,
@@ -245,42 +355,71 @@ int main(int argc, const char **argv) {
             C, CUDA_R_32F, m,
             CUBLAS_COMPUTE_32F_FAST_16F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
         cudaDeviceSynchronize();
     }
+
     auto toc = chrono::steady_clock::now();
 
-    int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
-    double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
-    double cublas_flops = double(num_flops) / tcublas / 1.0e9;
+    int64_t num_flops =
+        (2 * int64_t(m) * int64_t(n) * int64_t(k))
+        +
+        (2 * int64_t(m) * int64_t(n));
+
+    double tcublas =
+        chrono::duration<double>(toc - tic).count() / Nt;
+
+    double cublas_flops =
+        double(num_flops) / tcublas / 1.0e9;
 
     dim3 block(THREADS_PER_BLOCK);
-    dim3 grid((m + BLOCK_M - 1) / BLOCK_M, (n + BLOCK_N - 1) / BLOCK_N);
 
-    size_t smem_size = STAGES * BLOCK_K * (BLOCK_M + SMEM_PAD) * sizeof(half) +
-                       STAGES * BLOCK_N * (BLOCK_K + SMEM_PAD) * sizeof(half);
+    dim3 grid(
+        (m + BLOCK_M - 1) / BLOCK_M,
+        (n + BLOCK_N - 1) / BLOCK_N);
 
-    // CRITICAL FIX: Hopper defaults to 48KB of dynamic shared memory.
-    // A 4-stage pipeline requires ~75KB. You must request the higher limit explicitly.
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    size_t smem_size =
+        STAGES * BLOCK_K *
+        (BLOCK_M + SMEM_PAD) * sizeof(half)
+        +
+        STAGES * BLOCK_N *
+        (BLOCK_K + SMEM_PAD) * sizeof(half);
+
+    cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size);
 
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now();
-        kernel<<<grid, block, smem_size>>>(m, n, k, A16, B16, C2);
+
+        kernel<<<grid, block, smem_size>>>(
+            m, n, k,
+            A16, B16, C2);
+
         cudaDeviceSynchronize();
     }
+
     toc = chrono::steady_clock::now();
 
-    double tcutlass = chrono::duration<double>(toc - tic).count() / Nt;
-    double cutlass_flops = double(num_flops) / tcutlass / 1.0e9;
+    double tcutlass =
+        chrono::duration<double>(toc - tic).count() / Nt;
 
-    printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n", cublas_flops, cutlass_flops);
+    double cutlass_flops =
+        double(num_flops) / tcutlass / 1.0e9;
+
+    printf("CUBLAS: %.2f Gflops, CUTLASS: %.2f Gflops\n",
+           cublas_flops,
+           cutlass_flops);
 
     double err = 0;
+
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < m; j++) {
             err += fabs(C[m * i + j] - C2[m * i + j]);
         }
     }
+
     printf("error: %lf\n", err / n / m);
 
     cudaFree(A);
@@ -289,5 +428,6 @@ int main(int argc, const char **argv) {
     cudaFree(C2);
     cudaFree(A16);
     cudaFree(B16);
+
     cublasDestroy(cublas_handle);
 }
